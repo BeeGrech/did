@@ -93,6 +93,12 @@ It's also possible to set a timeout, if not specified it defaults to
 60 seconds.
 
     timeout = 10
+
+Use ``api_version`` to override the REST API version. Defaults to
+``latest`` (compatible with Jira Server/Data Center). Jira Cloud
+requires ``3``::
+
+    api_version = 3
 """
 
 import os
@@ -129,6 +135,9 @@ SSL_VERIFY = True
 
 # Default number of seconds waiting on Sentry before giving up
 TIMEOUT = 60.0
+
+# Default Jira REST API version ('latest' for Server/DC; '3' for Cloud)
+DEFAULT_API_VERSION = "latest"
 
 # State we are interested in
 DEFAULT_TRANSITION_TO = "Release Pending"
@@ -215,28 +224,48 @@ class Issue():
                with_worklog: bool = False) -> list["Issue"]:
         """ Perform issue search for given stats instance """
         # pylint: disable=too-many-branches
+        # pylint: disable=too-many-locals,too-many-statements
         log.debug("Search query: %s", query)
         issues = []
         # Fetch data from the server in batches of MAX_RESULTS issues
         fields = "summary,comment"
         if with_worklog:
             fields += ",worklog"
+        use_post = stats.parent.api_version == "3"
+        next_page_token: Optional[str] = None
         for batch in range(MAX_BATCHES):
-            encoded_query = urllib.parse.urlencode(
-                {
+            if use_post:
+                current_url = (
+                    f"{stats.parent.url}/rest/api"
+                    f"/{stats.parent.api_version}/search/jql")
+                payload: dict = {
                     "jql": query,
-                    "fields": fields,
+                    "fields": fields.split(","),
                     "maxResults": MAX_RESULTS,
-                    "startAt": batch *
-                    MAX_RESULTS,
-                    "expand": expand})
-            current_url = f"{stats.parent.url}/rest/api/latest/search?{encoded_query}"
+                    }
+                # expand (e.g. changelog) not supported by /search/jql
+                if next_page_token:
+                    payload["nextPageToken"] = next_page_token
+            else:
+                encoded_query = urllib.parse.urlencode(
+                    {
+                        "jql": query,
+                        "fields": fields,
+                        "maxResults": MAX_RESULTS,
+                        "startAt": batch * MAX_RESULTS,
+                        "expand": expand})
+                current_url = (
+                    f"{stats.parent.url}/rest/api/{stats.parent.api_version}"
+                    f"/search?{encoded_query}")
             log.debug("Fetching %s", current_url)
             while True:
                 try:
-                    response = stats.parent.session.get(
-                        current_url,
-                        timeout=timeout)
+                    if use_post:
+                        response = stats.parent.session.post(
+                            current_url, json=payload, timeout=timeout)
+                    else:
+                        response = stats.parent.session.get(
+                            current_url, timeout=timeout)
                     # Handle the exceeded rate limit
                     if response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
                         if response.headers.get("X-RateLimit-Remaining") == "0":
@@ -290,11 +319,17 @@ class Issue():
                 )
             log.data(pretty(data))
             issues.extend(data["issues"])
-            # If all issues fetched, we're done
-            if len(issues) >= data["total"]:
-                break
-            log.info("Batch %s: fetched %s issues out of %s",
-                     batch, len(issues), data["total"])
+            # Check pagination based on API type
+            if use_post:
+                if data.get("isLast", True):
+                    break
+                next_page_token = data.get("nextPageToken")
+                log.info("Batch %s: fetched %s issues so far", batch, len(issues))
+            else:
+                if len(issues) >= data["total"]:
+                    break
+                log.info("Batch %s: fetched %s issues out of %s",
+                         batch, len(issues), data["total"])
         # Return the list of issue objects
         return [
             Issue(issue, parent=stats.parent)
@@ -305,7 +340,8 @@ class Issue():
         """ True if the issue was commented by given user """
         for comment in self.comments:
             created = dateutil.parser.parse(comment["created"]).date()
-            if (comment["author"]["emailAddress"] == user.email and
+            if ("emailAddress" in comment["author"] and
+                    comment["author"]["emailAddress"] == user.email and
                     options.since.date < created < options.until.date):
                 return True
         return False
@@ -340,6 +376,13 @@ class JiraStats(Stats):
         self.user: User
         super().__init__(option, name, parent, user, options=options)
 
+    def _get_user_identifier(self) -> str:
+        """ Get the correct user identifier for JQL queries.
+        Jira Cloud requires email; Server/DC uses login name. """
+        if self.parent.is_jira_cloud:
+            return self.user.email
+        return self.user.login or self.user.email
+
     def fetch(self) -> None:
         raise NotImplementedError()
 
@@ -355,7 +398,7 @@ class JiraCreated(JiraStats):
             self.parent.project if self.parent.project is not None else "any project",
             self.user)
         query = (
-            f"creator = '{self.user.login or self.user.email}' "
+            f"creator = '{self._get_user_identifier()}' "
             f"AND created >= {self.options.since} "
             f"AND created <= {self.options.until}"
             )
@@ -377,7 +420,7 @@ class JiraCommented(JiraStats):
             self.user)
         if self.parent.use_scriptrunner:
             query = (
-                f"issueFunction in commented('by {self.user.login or self.user.email} "
+                f"issueFunction in commented('by {self._get_user_identifier()} "
                 f"after {self.options.since} "
                 f"before {self.options.until}')"
                 )
@@ -433,7 +476,7 @@ class JiraResolved(JiraStats):
             self.parent.project if self.parent.project is not None else "any project",
             self.user)
         query = (
-            f"assignee = '{self.user.login or self.user.email}' "
+            f"assignee = '{self._get_user_identifier()}' "
             f"AND resolved >= {self.options.since} "
             f"AND resolved <= {self.options.until}"
             )
@@ -454,7 +497,7 @@ class JiraTested(JiraStats):
             self.parent.project if self.parent.project is not None else "any project",
             self.user)
         query = (
-            f"tester = '{self.user.login or self.user.email}' "
+            f"tester = '{self._get_user_identifier()}' "
             f"AND resolved >= {self.options.since} "
             f"AND resolved <= {self.options.until}"
             )
@@ -475,7 +518,7 @@ class JiraContributed(JiraStats):
             self.parent.project if self.parent.project is not None else "any project",
             self.user)
         query = (
-            f"contributors in ('{self.user.login or self.user.email}') "
+            f"contributors in ('{self._get_user_identifier()}') "
             f"AND resolved >= {self.options.since} "
             f"AND resolved <= {self.options.until}"
             )
@@ -494,10 +537,10 @@ class JiraTransition(JiraStats):
             "[%s] Searching for issues transitioned to '%s' by '%s'",
             self.option,
             self.parent.transition_status,
-            self.user.login or self.user.email)
+            self._get_user_identifier())
         query = (
             f"status changed to '{self.parent.transition_status}' "
-            f"and status changed by '{self.user.login or self.user.email}' "
+            f"and status changed by '{self._get_user_identifier()}' "
             f"after {self.options.since} before {self.options.until}"
             )
         if self.parent.project:
@@ -512,9 +555,9 @@ class JiraWorklog(JiraStats):
         log.info(
             "[%s] Searching for issues for which work was logged by '%s'",
             self.option,
-            self.user.login or self.user.email)
+            self._get_user_identifier())
         query = (
-            f"worklogAuthor = '{self.user.login or self.user.email}' "
+            f"worklogAuthor = '{self._get_user_identifier()}' "
             f"and worklogDate >= {self.options.since} "
             f"and worklogDate < {self.options.until} "
             )
@@ -631,6 +674,11 @@ class JiraStatsGroup(StatsGroup):
         if "url" not in config:
             raise ReportError(f"No Jira url set in the [{option}] section")
         self.url = config["url"].rstrip("/")
+        # Detect if this is Jira Cloud (*.atlassian.net)
+        parsed_url = urllib.parse.urlparse(self.url)
+        hostname = (parsed_url.hostname or "").lower()
+        self.is_jira_cloud = (
+            hostname == "atlassian.net" or hostname.endswith(".atlassian.net"))
         # Optional authentication url
         if "auth_url" in config:
             self.auth_url = config["auth_url"]
@@ -662,6 +710,10 @@ class JiraStatsGroup(StatsGroup):
         if self.auth_type == "token":
             self._token_auth(option, config)
         self._set_ssl_verification(config)
+
+        # API version: default to '3' for Cloud, 'latest' for Server/DC
+        default_version = "3" if self.is_jira_cloud else DEFAULT_API_VERSION
+        self.api_version = config.get("api_version", default_version)
 
         # Make sure we have project set
         self.project: Optional[str] = config.get("project", None)
@@ -732,9 +784,10 @@ class JiraStatsGroup(StatsGroup):
     def _basic_auth_session(self) -> requests.Response:
         log.debug("Connecting to %s for basic auth", self.auth_url)
         basic_auth = (self.auth_username, self.auth_password)
+        self.session.auth = basic_auth
         try:
             response = self.session.get(
-                self.auth_url, auth=basic_auth, verify=self.ssl_verify,
+                self.auth_url, verify=self.ssl_verify,
                 timeout=self.timeout)
         except (requests.exceptions.ConnectionError,
                 urllib3.exceptions.NewConnectionError,
@@ -746,12 +799,12 @@ class JiraStatsGroup(StatsGroup):
         return response
 
     def _token_auth_session(self) -> requests.Response:
-        log.debug("Connecting to %s", f"{self.url}/rest/api/2/myself")
+        log.debug("Connecting to %s", f"{self.url}/rest/api/{self.api_version}/myself")
         self.session.headers["Authorization"] = f"Bearer {self.token}"
         while True:
             try:
                 response = self.session.get(
-                    f"{self.url}/rest/api/2/myself",
+                    f"{self.url}/rest/api/{self.api_version}/myself",
                     verify=self.ssl_verify,
                     timeout=self.timeout)
             except urllib3.exceptions.ProtocolError as error:
